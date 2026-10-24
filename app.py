@@ -1,9 +1,8 @@
 
-import sqlite3
-from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
+import psycopg2
 import streamlit as st
 
 from simulator import run_scenario, SCENARIOS
@@ -17,30 +16,36 @@ st.set_page_config(
     layout="wide"
 )
 
-DB_PATH = Path(__file__).resolve().parent / "water_monitoring.db"
+# -------------------------------
+# DATABASE CONNECTION
+# -------------------------------
+def get_connection():
+    database_url = st.secrets["DATABASE_URL"]
+    return psycopg2.connect(
+        database_url,
+        sslmode="require",
+        connect_timeout=10
+    )
 
 
-# -------------------------------
-# DATABASE
-# -------------------------------
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS readings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                scenario TEXT NOT NULL,
-                flow_lpm REAL,
-                tank_level_pct REAL,
-                observed_liters REAL,
-                baseline_liters REAL,
-                status TEXT,
-                alert_type TEXT,
-                message TEXT,
-                severity TEXT
-            )
-        """)
-        conn.commit()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS readings (
+                    id BIGSERIAL PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    flow_lpm DOUBLE PRECISION,
+                    tank_level_pct DOUBLE PRECISION,
+                    observed_liters DOUBLE PRECISION,
+                    baseline_liters DOUBLE PRECISION,
+                    status TEXT,
+                    alert_type TEXT,
+                    message TEXT,
+                    severity TEXT
+                )
+            """)
 
 
 def save_reading(scenario_name, result):
@@ -51,38 +56,52 @@ def save_reading(scenario_name, result):
         timespec="seconds"
     )
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO readings (
-                timestamp, scenario, flow_lpm, tank_level_pct,
-                observed_liters, baseline_liters, status,
-                alert_type, message, severity
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            timestamp,
-            scenario_name,
-            reading["flow_lpm"],
-            reading["tank_level_pct"],
-            reading["observed_liters"],
-            reading["baseline_liters"],
-            detection["status"],
-            detection["alert_type"],
-            detection["message"],
-            detection["severity"]
-        ))
-        conn.commit()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO readings (
+                    timestamp, scenario, flow_lpm, tank_level_pct,
+                    observed_liters, baseline_liters, status,
+                    alert_type, message, severity
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                timestamp,
+                scenario_name,
+                reading["flow_lpm"],
+                reading["tank_level_pct"],
+                reading["observed_liters"],
+                reading["baseline_liters"],
+                detection["status"],
+                detection["alert_type"],
+                detection["message"],
+                detection["severity"]
+            ))
 
 
 def load_history():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         return pd.read_sql_query(
             "SELECT * FROM readings ORDER BY id DESC",
             conn
         )
 
 
-init_db()
+def clear_history():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM readings")
+
+
+# -------------------------------
+# INITIALIZE DATABASE
+# -------------------------------
+try:
+    init_db()
+except Exception as e:
+    st.error("Database connection failed. Check your DATABASE_URL secret.")
+    st.caption(f"Error type: {type(e).__name__}")
+    st.stop()
 
 
 # -------------------------------
@@ -130,13 +149,17 @@ with st.sidebar:
 # RUN SIMULATION
 # -------------------------------
 if run_button:
-    result = run_scenario(selected_scenario)
-    save_reading(selected_scenario, result)
+    try:
+        result = run_scenario(selected_scenario)
+        save_reading(selected_scenario, result)
 
-    st.session_state["last_result"] = result
-    st.session_state["last_scenario"] = selected_scenario
+        st.session_state["last_result"] = result
+        st.session_state["last_scenario"] = selected_scenario
 
-    st.success("Simulation completed and saved!")
+        st.success("Simulation completed and saved to cloud database!")
+    except Exception as e:
+        st.error("Could not save the simulation to the cloud database.")
+        st.caption(f"Error type: {type(e).__name__}")
 
 
 # -------------------------------
@@ -168,9 +191,14 @@ if "last_result" in st.session_state:
 
 
 # -------------------------------
-# DASHBOARD METRICS
+# LOAD CLOUD HISTORY
 # -------------------------------
-history = load_history()
+try:
+    history = load_history()
+except Exception as e:
+    st.error("Could not load readings from the cloud database.")
+    st.caption(f"Error type: {type(e).__name__}")
+    st.stop()
 
 total = len(history)
 
@@ -186,6 +214,10 @@ else:
     flow = 0.0
     tank = 0.0
 
+
+# -------------------------------
+# DASHBOARD METRICS
+# -------------------------------
 c1, c2, c3, c4 = st.columns(4)
 
 c1.metric("Total Readings", total)
@@ -281,14 +313,14 @@ if total > 0:
     )
 
     if st.button("Clear History"):
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM readings")
-            conn.commit()
-
-        st.session_state.pop("last_result", None)
-        st.session_state.pop("last_scenario", None)
-        st.rerun()
-
+        try:
+            clear_history()
+            st.session_state.pop("last_result", None)
+            st.session_state.pop("last_scenario", None)
+            st.rerun()
+        except Exception as e:
+            st.error("Could not clear cloud history.")
+            st.caption(f"Error type: {type(e).__name__}")
 else:
     st.write("No history yet. Run your first simulation!")
 
