@@ -31,22 +31,21 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS readings (
-                    id BIGSERIAL PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    scenario TEXT NOT NULL,
-                    flow_lpm DOUBLE PRECISION,
-                    tank_level_pct DOUBLE PRECISION,
-                    observed_liters DOUBLE PRECISION,
-                    baseline_liters DOUBLE PRECISION,
-                    status TEXT,
-                    alert_type TEXT,
-                    message TEXT,
-                    severity TEXT
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS water_incidents (
+                                id BIGSERIAL PRIMARY KEY,
+                                created_at TIMESTAMPTZ DEFAULT NOW(),
+                                location TEXT NOT NULL,
+                                problem_type TEXT NOT NULL,
+                                description TEXT NOT NULL,
+                                source TEXT NOT NULL,
+                                incident_date DATE,
+                                severity TEXT NOT NULL,
+                                priority_score INTEGER NOT NULL,
+                                status TEXT DEFAULT 'Pending Review',
+                                alert_draft TEXT
                 )
             """)
-
 
 def save_reading(scenario_name, result):
     reading = result["reading"]
@@ -92,6 +91,110 @@ def clear_history():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM readings")
 
+# -------------------------------
+# WATER INCIDENT ANALYSIS
+# -------------------------------
+
+def assess_incident(problem_type, description):
+    """
+    Transparent rule-based priority assessment.
+    This is not an AI model or verified emergency assessment.
+    """
+
+    text = description.lower()
+
+    # Initial score based on incident type
+    type_scores = {
+        "Major Pipeline Burst": 60,
+        "Water Leakage": 40,
+        "Tank Overflow": 30,
+        "Water Shortage": 35,
+        "Contaminated Water": 60,
+        "Other": 20
+    }
+
+    score = type_scores.get(problem_type, 20)
+
+    # Add points for evidence of wider public impact
+    impact_keywords = {
+        "multiple houses": 15,
+        "hospital": 20,
+        "school": 10,
+        "main road": 10,
+        "flooding": 15,
+        "drinking water": 10,
+        "no water supply": 10
+    }
+
+    for keyword, points in impact_keywords.items():
+        if keyword in text:
+            score += points
+
+    score = min(score, 100)
+
+    if score >= 80:
+        severity = "Critical"
+    elif score >= 60:
+        severity = "High"
+    elif score >= 35:
+        severity = "Medium"
+    else:
+        severity = "Low"
+
+    return severity, score
+
+
+def save_incident(
+    location,
+    problem_type,
+    description,
+    source,
+    incident_date,
+    severity,
+    score
+):
+    alert_draft = (
+        f"Water incident report: {problem_type}. "
+        f"Location: {location}. "
+        f"Details: {description}. "
+        f"Reported source: {source}. "
+        f"Priority: {severity}. "
+        "Please verify the report and inspect if necessary."
+    )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO water_incidents (
+                    location,
+                    problem_type,
+                    description,
+                    source,
+                    incident_date,
+                    severity,
+                    priority_score,
+                    alert_draft
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                location,
+                problem_type,
+                description,
+                source,
+                incident_date,
+                severity,
+                score,
+                alert_draft
+            ))
+
+
+def load_incidents():
+    with get_connection() as conn:
+        return pd.read_sql_query("""
+            SELECT *
+            FROM water_incidents
+            ORDER BY priority_score DESC, created_at DESC
+        """, conn)
 
 # -------------------------------
 # INITIALIZE DATABASE
@@ -114,6 +217,104 @@ st.info(
     "Demo mode: This application uses simulated water readings. "
     "Alerts indicate possible problems, not confirmed physical leaks."
 )
+
+# -------------------------------
+# WATER INCIDENT REPORTING
+# -------------------------------
+
+st.divider()
+st.header("🌊 Real-World Water Incident Reporting")
+
+st.caption(
+    "Enter a reported water problem for initial priority assessment. "
+    "Reports are not independently verified."
+)
+
+with st.form("incident_form"):
+
+    location = st.text_input(
+        "Incident location",
+        placeholder="Example: Gandhipuram, Coimbatore"
+    )
+
+    problem_type = st.selectbox(
+        "Problem type",
+        [
+            "Water Leakage",
+            "Major Pipeline Burst",
+            "Tank Overflow",
+            "Water Shortage",
+            "Contaminated Water",
+            "Other"
+        ]
+    )
+
+    description = st.text_area(
+        "Incident description",
+        placeholder=(
+            "Describe the reported problem, "
+            "affected area and public impact."
+        )
+    )
+
+    source = st.text_input(
+        "Information source",
+        placeholder="Example: Official complaint / News report / Citizen report"
+    )
+
+    incident_date = st.date_input(
+        "Date of incident",
+        value=datetime.now().date()
+    )
+
+    submitted = st.form_submit_button(
+        "Analyse and Save Incident",
+        type="primary"
+    )
+
+    if submitted:
+
+        if not location.strip():
+            st.error("Please enter the incident location.")
+
+        elif not description.strip():
+            st.error("Please enter the incident description.")
+
+        elif not source.strip():
+            st.error("Please identify the information source.")
+
+        else:
+            severity, score = assess_incident(
+                problem_type,
+                description
+            )
+
+            try:
+                save_incident(
+                    location.strip(),
+                    problem_type,
+                    description.strip(),
+                    source.strip(),
+                    incident_date,
+                    severity,
+                    score
+                )
+
+                st.success("Incident report saved to Supabase!")
+
+                st.metric("Initial Priority", severity)
+                st.metric("Priority Score", f"{score}/100")
+
+                st.warning(
+                    "This is an initial rule-based assessment, "
+                    "not a verified emergency classification."
+                )
+
+                st.rerun()
+
+            except Exception as e:
+                st.error("Could not save the incident report.")
+                st.caption(f"Error type: {type(e).__name__}")
 
 
 # -------------------------------
@@ -270,7 +471,101 @@ with right:
     else:
         st.write("No readings available yet.")
 
+# -------------------------------
+# INCIDENT PRIORITY DASHBOARD
+# -------------------------------
 
+st.divider()
+st.header("🚨 Water Incident Priority Dashboard")
+
+try:
+    incidents = load_incidents()
+
+    if incidents.empty:
+        st.info(
+            "No incident reports yet. "
+            "Submit a report using the form above."
+        )
+
+    else:
+        critical_count = int(
+            (incidents["severity"] == "Critical").sum()
+        )
+
+        high_count = int(
+            (incidents["severity"] == "High").sum()
+        )
+
+        pending_count = int(
+            (incidents["status"] == "Pending Review").sum()
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Total Incidents", len(incidents))
+        c2.metric("Critical Incidents", critical_count)
+        c3.metric("Pending Review", pending_count)
+
+        st.subheader("Incident Reports")
+
+        st.dataframe(
+            incidents[
+                [
+                    "created_at",
+                    "location",
+                    "problem_type",
+                    "severity",
+                    "priority_score",
+                    "status",
+                    "source"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.subheader("Prepare Water Board Alert")
+
+        selected_id = st.selectbox(
+            "Select an incident",
+            incidents["id"].tolist(),
+            format_func=lambda incident_id: (
+                f"Incident #{incident_id} — "
+                f"{incidents.loc[
+                    incidents['id'] == incident_id,
+                    'location'
+                ].iloc[0]}"
+            )
+        )
+
+        selected = incidents[
+            incidents["id"] == selected_id
+        ].iloc[0]
+
+        st.text_area(
+            "Complaint summary",
+            value=selected["alert_draft"] or "",
+            height=150,
+            key=f"alert_draft_{selected_id}"
+        )
+
+        st.caption(
+            "Review the source and incident details before forwarding. "
+            "This prototype does not automatically notify the Water Board."
+        )
+
+        st.download_button(
+            "Download Incident Report",
+            data=incidents[
+                incidents["id"] == selected_id
+            ].to_csv(index=False).encode("utf-8"),
+            file_name=f"water_incident_{selected_id}.csv",
+            mime="text/csv"
+        )
+
+except Exception as e:
+    st.error("Could not load incident reports.")
+    st.caption(f"Error type: {type(e).__name__}")
 # -------------------------------
 # HISTORY
 # -------------------------------
